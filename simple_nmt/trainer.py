@@ -107,7 +107,9 @@ class Trainer():
                                                                                                  ))
 
             # In orther to avoid gradient exploding, we apply gradient clipping.
-            torch_utils.clip_grad_norm_(self.model.parameters(),
+            # gradient clipping 이라는 테크닉.  
+            # gradient rescent할때, gradient 벡터 방향은 유지한 채 크기만 조절하는 것.
+            torch_utils.clip_grad_norm_(self.model.parameters(), 
                                         self.config.max_grad_norm
                                         )
             # Take a step of gradient descent.
