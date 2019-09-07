@@ -1,5 +1,6 @@
 # from nltk.translate.bleu_score import sentence_bleu as score_func
 from nltk.translate.gleu_score import sentence_gleu as score_func
+#bleu나 gleu 중 골라서 쓰면 됨. 둘다 해 보고 성능이 더좋게 나오는것 써도 되고..
 
 import torch
 
@@ -13,11 +14,11 @@ VERBOSE_BATCH_WISE = 2
 
 from simple_nmt.mle_trainer import MaximumLikelihoodEstimationTrainer
 
-
-class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
+#강화학습
+class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer): # MaximumLikelihoodEstimationTrainer 상속 받음. train함수만 갖다씀. 나머지는 직접 작성
 
     @staticmethod
-    def get_reward(y_hat, y, n_gram=6):
+    def get_reward(y_hat, y, n_gram=6): #우리가 피해야되는 for문들의 향연.. for문은 seq이기 때문에 느리다.. 병렬로 짤 필요가 있음.
         import data_loader
         # This method gets the reward based on the sampling result and reference sentence.
         # For now, we uses GLEU in NLTK, but you can used your own well-defined reward function.
@@ -52,7 +53,7 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
             # for utils.score_sentence
             # scores += [score_func(ref, hyp, 4, smooth = 1)[-1] * 100.]
         scores = torch.FloatTensor(scores).to(y.device)
-        # |scores| = (batch_size)
+        # |scores| = (batch_size) 그냥 배치 사이즈를 가짐.
 
         return scores
 
@@ -60,18 +61,19 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
     def get_gradient(y_hat, y, crit, reward=1):
         from torch.nn import functional as F
         import data_loader
-        # |y| = (batch_size, length)
-        # |y_hat| = (batch_size, length, output_size)
-        # |reward| = (batch_size)
+        # |y| = (batch_size, length) # y는 실제 정답X. 내가 이번에 sampling한 녀석.
+        # |y_hat| = (batch_size, length, output_size) #softmax 결과값
+        # |reward| = (batch_size) #baseline 뺀것
         batch_size = y.size(0)
         output_size = y_hat.size(-1)
 
         # Before we get the gradient, multiply -reward for each sample and each time-step.
-        y_hat = y_hat * -reward.view(-1, 1, 1).expand(*y_hat.size())
+        y_hat = y_hat * -reward.view(-1, 1, 1).expand(*y_hat.size()) #reward.view에서 view는 reshape
+                                              # |reward| = (bs, 1, 1) -expand-> (bs, length, |v|(아웃풋 사이즈)) 
 
         # Generate one-hot to get log-probability.
         y_hat = y_hat.view(-1, y_hat.size(-1))
-        y = F.one_hot(y.view(-1), num_classes=y_hat.size(-1)).float()
+        y = F.one_hot(y.view(-1), num_classes=y_hat.size(-1)).float() #원핫을 먼저 구한다. 만약 4 이면 --> 0 0 0 0 1 0 0 ... 이게 |v|
         # |y| = |y_hat| = (batch_size * length, output_size)
         
         # Generate and apply loss weight to ignore the PAD.
@@ -79,7 +81,7 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
         loss_weight[data_loader.PAD] = 0.
         y = y * loss_weight.view(1, -1)
 
-        log_prob = (y * y_hat).view(batch_size, -1)
+        log_prob = (y * y_hat).view(batch_size, -1) 
         # |log_prob| = (batch_size, length)
         log_prob.sum().div(batch_size).backward()
 
@@ -96,13 +98,13 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
         return log_prob
 
     @staticmethod
-    def step(engine, mini_batch):
+    def step(engine, mini_batch): #수식이 어떻게 구현되었는지 볼것.
         from utils import get_grad_norm, get_parameter_norm
 
         # You have to reset the gradients of all model parameters
         # before to take another step in gradient descent.
-        engine.model.train()        
-        engine.optimizer.zero_grad()
+        engine.model.train()        #트레인 모드로 와라.
+        engine.optimizer.zero_grad() #grad 초기화.
 
         # Raw target variable has both BOS and EOS token. 
         # The output of sequence-to-sequence does not have BOS token. 
@@ -112,7 +114,7 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
         # |y| = (batch_size, length)
 
         # Take sampling process because set False for is_greedy.
-        y_hat, indice = engine.model.search(
+        y_hat, indice = engine.model.search( #새로 생김. 
             x,
             is_greedy=False,
             max_length=engine.config.max_length
@@ -121,31 +123,33 @@ class MinimumRiskTrainer(MaximumLikelihoodEstimationTrainer):
         actor_reward = MinimumRiskTrainer.get_reward(
             indice,
             y,
-            n_gram=engine.config.rl_n_gram
+            n_gram=engine.config.rl_n_gram #보통 4개까지 하는데, 6개로 정함. 이유는 actor_reward를 돌리게 되는 경우에, 얘는 fully tockenize된 상태이기 때문에 더 많이 봐야된다.
         )
         # |y_hat| = (batch_size, length, output_size)
         # |indice| = (batch_size, length)
         # |actor_reward| = (batch_size)
+        ## << 여기까지 11페이지 수식의 뒤 평균 앞부분
 
         # Take samples as many as n_samples, and get average rewards for them.
         # I figured out that n_samples = 1 would be enough.
-        baseline = []
-        with torch.no_grad():
-            for _ in range(engine.config.rl_n_samples):
+        baseline = [] #미분이 필요가 없다. 
+        with torch.no_grad(): #gradient를 안할거니까 no_grad를 해줌.
+            for _ in range(engine.config.rl_n_samples): #k번 만큼 for문 돌면서 sampling함. 강사는 1번만함.
                 _, sampled_indice = engine.model.search(
                     x,
                     is_greedy=False,
                     max_length=engine.config.max_length,
                 )
-                baseline += [
-                    MinimumRiskTrainer.get_reward(
+                baseline += [ #리워드 넣어서 baseline에 추가.
+                    MinimumRiskTrainer.get_reward( 
                         sampled_indice,
                         y,
                         n_gram=engine.config.rl_n_gram,
                     )
                 ]
 
-            baseline = torch.stack(baseline).sum(dim=0).div(engine.config.rl_n_samples)
+            baseline = torch.stack(baseline).sum(dim=0).div(engine.config.rl_n_samples) #여기에 나오는 dim은 없어지는 dimension
+            #11페이지 수식의 뒤 평균까지 구했다.
             # |baseline| = (n_samples, batch_size) --> (batch_size)
 
         # Now, we have relatively expected cumulative reward.
